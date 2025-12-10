@@ -6,9 +6,13 @@ import threading
 import time
 
 import voluptuous as vol
-from waterfurnace.waterfurnace import WaterFurnace, WFCredentialError, WFException
 
 from homeassistant.components import persistent_notification
+from homeassistant.components.waterfurnace.waterfurnace import (
+    WaterFurnace,
+    WFException,
+    WFReading,
+)
 from homeassistant.const import (
     CONF_PASSWORD,
     CONF_USERNAME,
@@ -56,15 +60,16 @@ def setup(hass: HomeAssistant, base_config: ConfigType) -> bool:
     # NOTE(sdague): login will throw an exception if this doesn't
     # work, which will abort the setup.
     try:
-        wfconn.login()
+        login_resp = wfconn.login()
     except WFCredentialError:
         _LOGGER.error("Invalid credentials for waterfurnace login")
         return False
 
-    hass.data[DOMAIN] = WaterFurnaceData(hass, wfconn)
+    hass.data[DOMAIN] = WaterFurnaceData(hass, wfconn, login_resp)
     hass.data[DOMAIN].start()
 
     discovery.load_platform(hass, Platform.SENSOR, DOMAIN, {}, config)
+    discovery.load_platform(hass, Platform.CLIMATE, DOMAIN, {}, config)
     return True
 
 
@@ -79,7 +84,7 @@ class WaterFurnaceData(threading.Thread):
     to do.
     """
 
-    def __init__(self, hass, client):
+    def __init__(self, hass, client, login_resp):
         """Initialize the data object."""
         super().__init__()
         self.hass = hass
@@ -88,6 +93,12 @@ class WaterFurnaceData(threading.Thread):
         self.data = None
         self._shutdown = False
         self._fails = 0
+        self.gwids = []
+        self.datas = {}
+
+        for location in login_resp["locations"]:
+            for gateway in location["gateways"]:
+                self.gwids.append(gateway["gwid"])
 
     def _reconnect(self):
         """Reconnect on a failure."""
@@ -150,7 +161,10 @@ class WaterFurnaceData(threading.Thread):
                 return
 
             try:
-                self.data = self.client.read()
+                for gwid in self.gwids:
+                    self.data = self.client.read_with_retry(gwid)
+                    self.datas[gwid] = self.data
+                    dispatcher_send(self.hass, f"{UPDATE_TOPIC}-{gwid}")
 
             except WFException:
                 # WFExceptions are things the WF library understands
@@ -160,5 +174,4 @@ class WaterFurnaceData(threading.Thread):
                 self._reconnect()
 
             else:
-                dispatcher_send(self.hass, UPDATE_TOPIC)
                 time.sleep(SCAN_INTERVAL.total_seconds())
